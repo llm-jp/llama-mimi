@@ -1,46 +1,15 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    MimiModel,
+    AutoFeatureExtractor,
+    StoppingCriteria,
+)
 import torch
-from transformers import MimiModel, AutoFeatureExtractor
-from transformers import StoppingCriteria
-import random
-import numpy as np
 import torchaudio
-import soundfile as sf
 import re
-
-
-def text_to_audio_values(
-    text: str,
-    num_quantizers: int,
-    output_file: str,
-    audio_tokenizer,
-    feature_extractor,
-):
-    # Extract (val, idx) pairs from the <val_idx> format in the text
-    matches = re.findall(r"<(\d+)_(\d+)>", text)
-    vals = []
-
-    for i in range(0, len(matches), num_quantizers):
-        chunk = matches[i : i + num_quantizers]
-        if len(chunk) < num_quantizers:
-            break
-        indices = [int(idx) for _, idx in chunk]
-        if indices == list(range(num_quantizers)):
-            vals.extend(int(val) for val, _ in chunk)
-        else:
-            break
-
-    vals = vals[: len(vals) - len(vals) % num_quantizers]
-    tensor_bt4 = torch.tensor(vals).reshape(1, -1, num_quantizers)  # (B, T, 4)
-    tensor_b4t = tensor_bt4.transpose(1, 2)  # (B, 4, T)
-
-    audio_values = audio_tokenizer.decode(tensor_b4t)[0]
-
-    sf.write(
-        output_file,
-        audio_values[0][0].detach().cpu().numpy(),
-        feature_extractor.sampling_rate,
-    )
+import requests
+import io
 
 
 def audio_array_to_text(
@@ -48,12 +17,7 @@ def audio_array_to_text(
     audio_tokenizer,
     feature_extractor,
     num_quantizers: int,
-    max_seconds: int = 20,
 ) -> str:
-    # truncate the audio array to the expected length
-    if audio_array.shape[-1] > max_seconds * feature_extractor.sampling_rate:
-        audio_array = audio_array[: max_seconds * feature_extractor.sampling_rate]
-        #
     inputs = feature_extractor(
         raw_audio=audio_array,
         sampling_rate=feature_extractor.sampling_rate,
@@ -67,7 +31,6 @@ def audio_array_to_text(
         )
     flatten_audio_codes = encoder_outputs.audio_codes.transpose(1, 2).reshape(-1)
     assert flatten_audio_codes.numel() % num_quantizers == 0
-
     steps = []
     for i in range(0, flatten_audio_codes.numel(), num_quantizers):
         group = [
@@ -79,15 +42,37 @@ def audio_array_to_text(
 
     text = "".join(parts)
 
-    del inputs, encoder_outputs, flatten_audio_codes
-    torch.cuda.empty_cache()
     return f"<audio>{text}</audio>"
 
 
-def set_determinism(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def text_to_audio_values(
+    text: str,
+    num_quantizers: int,
+    output_file: str,
+    audio_tokenizer,
+    feature_extractor,
+):
+    # Extract (val, idx) pairs from the <val_idx> format in the text
+    matches = re.findall(r"<(\d+)_(\d+)>", text)
+    vals = []
+    for i in range(0, len(matches), num_quantizers):
+        chunk = matches[i : i + num_quantizers]
+        if len(chunk) < num_quantizers:
+            break
+        indices = [int(idx) for _, idx in chunk]
+        if indices == list(range(num_quantizers)):
+            vals.extend(int(val) for val, _ in chunk)
+        else:
+            break
+    vals = vals[: len(vals) - len(vals) % num_quantizers]
+    tensor_bt4 = torch.tensor(vals).reshape(1, -1, num_quantizers)  # (B, T, 4)
+    tensor_b4t = tensor_bt4.transpose(1, 2)  # (B, 4, T)
+    audio_values = audio_tokenizer.decode(tensor_b4t)[0]
+    torchaudio.save(
+        output_file,
+        audio_values[0].detach().cpu(),
+        feature_extractor.sampling_rate,
+    )
 
 
 class StopOnAudioEnd(StoppingCriteria):
@@ -104,14 +89,12 @@ class StopOnAudioEnd(StoppingCriteria):
         return input_ids[0][-len(self.target_ids) :].tolist() == self.target_ids
 
 
-set_determinism()
-
 temperature = 0.8
 top_k = 30
 do_sample = True
 max_length = 1024
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_id = "models/Llama-3.2-1B_peoples_speech-q4-s1024"
+model_id = "llm-jp/Llama-Mimi-1.3B"
 model = (
     AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     .eval()
@@ -123,8 +106,12 @@ audio_tokenizer = MimiModel.from_pretrained("kyutai/mimi")
 feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
 stopping_criteria = StopOnAudioEnd(tokenizer)
 
-audio_file = "assets/great_day_gt.wav"
-waveform, sample_rate = torchaudio.load(audio_file)
+audio_url = (
+    "https://speed1313.github.io/llama-mimi/data/prompt/natural/great_day_gt.wav"
+)
+response = requests.get(audio_url)
+response.raise_for_status()
+waveform, sample_rate = torchaudio.load(io.BytesIO(response.content))
 if sample_rate != feature_extractor.sampling_rate:
     waveform = torchaudio.transforms.Resample(
         sample_rate, feature_extractor.sampling_rate

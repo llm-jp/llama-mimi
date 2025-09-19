@@ -2,7 +2,7 @@
 
 # Llama-Mimi
 #### Autoregressive Speech Language Modeling with Interleaved Semantic and Acoustic Tokens
-| [📃Paper](https://arxiv.org/abs/2509.14882) | [🤗Models](https://huggingface.co/llm-jp/Llama-Mimi-1.3B) | [🗣️Online Demo](https://speed1313.github.io/llama-mimi/)
+| [📃Paper](https://arxiv.org/abs/2509.14882) | [🤗Models](https://huggingface.co/llm-jp/Llama-Mimi-1.3B) | [🗣️Online Demo](https://speed1313.github.io/llama-mimi/) |
 
 <img src="assets/llama-mimi.png" width="60%"/>
 
