@@ -29,7 +29,7 @@ Generate audio continuations from a given audio prompt.
 uv run python inference.py
 ```
 
-[▶️ Listen to example](assets/output.wav)
+[▶️ Listen to example](https://speed1313.github.io/llama-mimi)
 
 ## Train Llama-Mimi
 
