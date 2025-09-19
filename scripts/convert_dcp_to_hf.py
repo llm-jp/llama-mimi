@@ -6,8 +6,8 @@ from torchtitan.train import expand_tokenizer_with_unit_tokens
 
 if __name__ == "__main__":
     num_quantizers = 4
-    checkpoint_id = f"outputs/Llama-3.2-1B_all-q4-s1024/checkpoint/step-1000"
-    output_dir = f"models/Llama-3.2-1B_all-q4-s1024"
+    checkpoint_id = f"outputs/Llama-3.2-1B_peoples_speech-q4-s1024/checkpoint/step-1000"
+    output_dir = f"models/Llama-3.2-1B_peoples_speech-q4-s1024"
     model_name = "meta-llama/Llama-3.2-1B"
     model = AutoModelForCausalLM.from_pretrained(model_name)
 

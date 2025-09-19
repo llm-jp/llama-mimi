@@ -99,7 +99,14 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         infinite: bool = False,
         task: str = "a2a",
     ) -> None:
-        if dataset_name == "librispeech_asr_train":
+        if dataset_name == "peoples_speech":
+            ds = load_dataset(
+                "MLCommons/peoples_speech", "clean", split="train", streaming=True
+            )
+            ds = ds.cast_column(
+                "audio", Audio(sampling_rate=feature_extractor.sampling_rate)
+            )
+        elif dataset_name == "librispeech_asr_train":
             ds = load_dataset(
                 "openslr/librispeech_asr",
                 split="train.other.500",

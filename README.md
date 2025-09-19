@@ -24,7 +24,7 @@ uv sync
 
 ## Generate Speech
 
-Generate audio continuations from a given audio prompt.
+Generate audio continuations from a given audio prompt using our pretrained model (Llama-Mimi-1.3B):
 ```bash
 uv run python inference.py
 ```
@@ -33,34 +33,52 @@ uv run python inference.py
 
 ## Train Llama-Mimi
 
-To train the model on the LibriSpeech dataset, run:
+To train the model on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech), run:
 ```bash
 bash train.sh
 ```
-To use a custom dataset, update the configuration in `torchtitan/datasets/hf_dataset.py`.
+To train on a custom dataset, update the configuration in torchtitan/datasets/hf_dataset.py.
 
+We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
 
 After training, convert dcp checkpoint to HuggingFace format to infer with the model:
+
 ```bash
 uv run python scripts/convert_dcp_to_hf.py
 ```
 
 
 ## Evaluation
-Evaluate the model on various benchmarks:
+You can evaluate our models on SALMon, sLM21 (sWUGGY and sBLIMP), and sStoryCloze tasks.
+
+SALMon:
 ```bash
 uv run python eval/salmon.py --model_name llm-jp/Llama-Mimi-1.3B
+```
+
+sStoryCloze:
+```bash
 uv run python eval/sStoryCloze.py --model_name llm-jp/Llama-Mimi-1.3B
+```
+
+sLM21:
+```bash
 uv run python eval/sLM21.py --model_name llm-jp/Llama-Mimi-1.3B
 ```
 
 
 
 ## Acknowledge
-This code is built on top of [TorchTitan](https://github.com/pytorch/torchtitan).
+
+- Our training code is built on top of [TorchTitan](https://github.com/pytorch/torchtitan).
+
+- Our model employs [Llama 3](https://arxiv.org/abs/2407.21783) as the base language model, and [Mimi](https://arxiv.org/abs/2410.00037) as the audio tokenizer.
 
 
 ## Citation
+Star us on GitHub if you find this repository useful! ⭐
+
+If you find this work interesting, please cite our paper:
 ```
 @misc{sugiura2025llamamimispeechlanguagemodels,
       title={Llama-Mimi: Speech Language Models with Interleaved Semantic and Acoustic Tokens},
@@ -72,3 +90,4 @@ This code is built on top of [TorchTitan](https://github.com/pytorch/torchtitan)
       url={https://arxiv.org/abs/2509.14882},
 }
 ```
+

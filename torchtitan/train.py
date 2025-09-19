@@ -207,10 +207,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # model = AutoModelForCausalLM.from_pretrained(job_config.model.name, torch_dtype=torch.bfloat16)
 
         if job_config.model.pretrained:
-            model = AutoModelForCausalLM.from_pretrained(job_config.model.name)
+            model = AutoModelForCausalLM.from_pretrained(
+                job_config.model.name, attn_implementation="flash_attention_2"
+            )
         else:
             config = AutoConfig.from_pretrained(job_config.model.name)
-            model = AutoModelForCausalLM.from_config(config)
+            model = AutoModelForCausalLM.from_config(
+                config, attn_implementation="flash_attention_2"
+            )
 
         embedding_size = model.get_input_embeddings().weight.shape[0]
         if len(tokenizer) > embedding_size:
@@ -707,9 +711,9 @@ if __name__ == "__main__":
     config = config_manager.parse_args()
     trainer: Optional[Trainer] = None
 
-    # import torch.multiprocessing as mp
+    import torch.multiprocessing as mp
 
-    # mp.set_start_method("spawn")
+    mp.set_start_method("spawn")
 
     try:
         trainer = Trainer(config)
@@ -733,4 +737,3 @@ if __name__ == "__main__":
         trainer.close()
         torch.distributed.destroy_process_group()
         logger.info("Process group destroyed.")
-                                    

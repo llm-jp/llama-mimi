@@ -60,10 +60,10 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
         dp_world_size: int,
         batch_size: int,
         collate_fn: Callable | None = None,
-        num_workers: int = 0,
-        prefetch_factor: int | None = None,
-        pin_memory: bool = False,
-        persistent_workers: bool | None = None,
+        num_workers: int = 2,
+        prefetch_factor: int | None = 2,
+        pin_memory: bool = True,
+        persistent_workers: bool | None = True,
     ):
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank

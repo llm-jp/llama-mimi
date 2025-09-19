@@ -28,6 +28,7 @@ dependencies = [
     "pyannote-audio>=3.3.2",
     "python-dotenv>=1.1.1",
     "openai>=1.107.1",
+    "flash-attn==2.8.2",
 ]
 
 [dependency-groups]
@@ -44,3 +45,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["torchtitan"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]

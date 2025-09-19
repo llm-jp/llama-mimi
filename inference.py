@@ -71,8 +71,7 @@ def audio_array_to_text(
     steps = []
     for i in range(0, flatten_audio_codes.numel(), num_quantizers):
         group = [
-            f"<{flatten_audio_codes[i + j].item()}_{j}>"
-            for j in range(num_quantizers)
+            f"<{flatten_audio_codes[i + j].item()}_{j}>" for j in range(num_quantizers)
         ]
         steps.append(group)
 
@@ -90,6 +89,7 @@ def set_determinism(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+
 class StopOnAudioEnd(StoppingCriteria):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -103,6 +103,7 @@ class StopOnAudioEnd(StoppingCriteria):
             return False
         return input_ids[0][-len(self.target_ids) :].tolist() == self.target_ids
 
+
 set_determinism()
 
 temperature = 0.8
@@ -111,7 +112,11 @@ do_sample = True
 max_length = 1024
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_id = "llm-jp/Llama-Mimi-1.3B"
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).eval().to(device)
+model = (
+    AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    .eval()
+    .to(device)
+)
 num_quantizers = model.config.num_quantizers
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 audio_tokenizer = MimiModel.from_pretrained("kyutai/mimi")
@@ -121,7 +126,9 @@ stopping_criteria = StopOnAudioEnd(tokenizer)
 audio_file = "assets/great_day_gt.wav"
 waveform, sample_rate = torchaudio.load(audio_file)
 if sample_rate != feature_extractor.sampling_rate:
-    waveform = torchaudio.transforms.Resample(sample_rate, feature_extractor.sampling_rate)(waveform)
+    waveform = torchaudio.transforms.Resample(
+        sample_rate, feature_extractor.sampling_rate
+    )(waveform)
     sample_rate = feature_extractor.sampling_rate
 prompt_array = waveform.squeeze().cpu().numpy()
 
