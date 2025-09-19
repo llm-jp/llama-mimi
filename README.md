@@ -29,11 +29,7 @@ Generate audio continuations from a given audio prompt.
 uv run python inference.py
 ```
 
-An example output:
-
-<audio controls>
-  <source src="assets/output.wav" type="audio/wav">
-</audio>
+[▶️ Listen to example](assets/output.wav)
 
 ## Train Llama-Mimi
 
