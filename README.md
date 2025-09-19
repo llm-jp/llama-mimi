@@ -31,7 +31,7 @@ uv run python inference.py
 
 [▶️ Listen to example](https://speed1313.github.io/llama-mimi)
 
-## Train Llama-Mimi
+## Train Llama-Mimi on The People's Speech
 
 To train the model on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech), run:
 ```bash
