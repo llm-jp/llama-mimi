@@ -101,7 +101,10 @@ class HuggingFaceDataset(IterableDataset, Stateful):
     ) -> None:
         if dataset_name == "peoples_speech":
             ds = load_dataset(
-                "MLCommons/peoples_speech", "clean", split="train", streaming=True
+                "parquet",
+                data_dir="data/peoples_speech/clean",
+                split="train",
+                streaming=True,
             )
             ds = ds.cast_column(
                 "audio", Audio(sampling_rate=feature_extractor.sampling_rate)

@@ -41,13 +41,22 @@ uv run python inference.py
 
 ## Pre-train Llama-Mimi on The People's Speech
 
-To train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech), run:
+To pre-train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech), first download the dataset locally:
+```bash
+uv run huggingface-cli download  MLCommons/peoples_speech  --repo-type dataset --local-dir data/peoples_speech
+```
+
+Then launch training with:
 ```bash
 torchrun --nproc_per_node=8 --local-ranks-filter 0 \
       --role rank --tee 3 -m torchtitan.train \
       --job.config_file config/llama3_2_1b_peoples_speech.toml
 ```
+You can monitor training statistics with Weights & Biases (W&B).
 
+<div align="center">
+<img src="assets/log_validation.png" width="60%"/>
+</div>
 
 To use a custom dataset, update the configuration in `torchtitan/datasets/hf_dataset.py`. We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
 
