@@ -12,12 +12,20 @@
 ## Introduction
 Llama-Mimi is a speech language model that uses a unified tokenizer (Mimi) and a single Transformer decoder (Llama) to jointly model sequences of interleaved semantic and acoustic tokens.
 Trained on ~240k hours of English audio, Llama-Mimi achieves state-of-the-art performance in acoustic consistency on [SALMon](https://arxiv.org/abs/2409.07437) and effectively preserves speaker identity.
+
 Visit our [demo site](https://speed1313.github.io/llama-mimi/) to hear generated speech samples.
 
 
+## Repository Overview
+This repository lets you:
+- Run inference with our pretrained models
+- Pre-train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech)
+- Evaluate the model on multiple benchmarks
 
 ## Setup
-Install dependencies:
+
+
+Install dependencies using uv:
 ```bash
 uv sync
 ```
@@ -29,19 +37,21 @@ Generate audio continuations from a given audio prompt using our pretrained mode
 uv run python inference.py
 ```
 
-[▶️ Listen to example](https://speed1313.github.io/llama-mimi)
+[▶️ Listen to samples on our demo site](https://speed1313.github.io/llama-mimi)
 
-## Train Llama-Mimi on The People's Speech
+## Pre-train Llama-Mimi on The People's Speech
 
-To train the model on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech), run:
+To train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech), run:
 ```bash
-bash train.sh
+torchrun --nproc_per_node=8 --local-ranks-filter 0 \
+      --role rank --tee 3 -m torchtitan.train \
+      --job.config_file config/llama3_2_1b_peoples_speech.toml
 ```
-To train on a custom dataset, update the configuration in torchtitan/datasets/hf_dataset.py.
 
-We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
 
-After training, convert dcp checkpoint to HuggingFace format to infer with the model:
+To use a custom dataset, update the configuration in `torchtitan/datasets/hf_dataset.py`. We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
+
+After training, convert dcp checkpoint to HuggingFace format to use the model with `transformers` library:
 
 ```bash
 uv run python scripts/convert_dcp_to_hf.py
@@ -49,7 +59,7 @@ uv run python scripts/convert_dcp_to_hf.py
 
 
 ## Evaluation
-You can evaluate our models on SALMon, sLM21 (sWUGGY and sBLIMP), and sStoryCloze tasks.
+Evaluate models on [SALMon](https://github.com/slp-rl/salmon), [sLM21](https://arxiv.org/abs/2104.14700) (sWUGGY and sBLIMP), and [sStoryCloze](https://github.com/slp-rl/SpokenStoryCloze) tasks.
 
 SALMon:
 ```bash
