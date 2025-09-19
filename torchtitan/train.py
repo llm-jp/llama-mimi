@@ -1,0 +1,735 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import importlib
+import os
+import time
+from datetime import timedelta
+from typing import Any, Generator, Iterable, Optional
+
+import torch
+from torch.distributed.elastic.multiprocessing.errors import record
+
+import torchtitan.protocols.train_spec as train_spec_module
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.dataloader import DataloaderStopIteration
+from torchtitan.components.ft import FTManager, maybe_semi_sync_training
+from torchtitan.components.loss import rescale_accumulated_loss
+from torchtitan.components.metrics import (
+    build_metrics_processor,
+    ensure_pp_loss_visible,
+)
+from torchtitan.config_manager import ConfigManager, JobConfig
+from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.protocols.model_converter import build_model_converters
+from torchtitan.tools import utils
+from torchtitan.tools.logging import init_logger, logger
+from torchtitan.tools.profiling import (
+    maybe_enable_memory_snapshot,
+    maybe_enable_profiling,
+)
+import torch.nn as nn
+
+
+def expand_tokenizer_with_unit_tokens(tokenizer, codebook_size=2048, num_quantizers=8):
+    """
+    Add <{id}_{channel}> format tokens to the tokenizer vocabulary.
+    """
+    new_tokens = [
+        f"<{x}_{i}>" for x in range(codebook_size) for i in range(num_quantizers)
+    ]
+    existing_tokens = set(tokenizer.get_vocab().keys())
+    added_tokens = [tok for tok in new_tokens if tok not in existing_tokens]
+    tokenizer.add_tokens(added_tokens)
+    # add <audio> and </audio> tokens
+    tokenizer.add_tokens(["<audio>", "</audio>"])
+    return tokenizer
+
+
+def get_nparams_and_flops(model, seq_len: int) -> (int, int):
+    nparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    nparams_embedding = sum(
+        sum(p.numel() for p in m.parameters())
+        for m in model.children()
+        if isinstance(m, nn.Embedding)
+    )
+
+    config = model.config
+
+    try:
+        l = config.num_hidden_layers
+        h = config.num_attention_heads
+        d = config.hidden_size
+    except AttributeError:
+        raise ValueError("Model configuration does not have the required attributes.")
+
+    q = d // h  # Query dimension per head
+    t = seq_len
+    # Reasoning behind the factor of 12 for the self-attention part of the formula:
+    # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
+    # 2. the flash attention does 1 more matmul recomputation in the backward
+    #    but recomputation should not be counted in calculating MFU           (+0)
+    # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
+    # 4. we follow the convention and do not account for sparsity in causal attention
+    num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+
+    return nparams, num_flops_per_token
+
+
+class Trainer(torch.distributed.checkpoint.stateful.Stateful):
+    # core configs
+    job_config: JobConfig
+    parallel_dims: ParallelDims
+    train_spec: train_spec_module.TrainSpec
+
+    # swappable training components in TrainSpec
+    dataloader: train_spec_module.BaseDataLoader
+    model_parts: list[torch.nn.Module]
+    loss_fn: train_spec_module.LossFunction
+    optimizers: train_spec_module.OptimizersContainer
+    lr_schedulers: train_spec_module.LRSchedulersContainer
+    validator: train_spec_module.BaseValidator
+    metrics_processor: train_spec_module.MetricsProcessor
+
+    # non-swappable training components
+    checkpointer: CheckpointManager
+    ft_manager: FTManager
+
+    # runtime utilities
+    device: torch.device
+    gc_handler: utils.GarbageCollection
+    train_context: Generator[None, None, None]
+    gradient_accumulation_steps: int
+    pp_has_first_stage: bool
+    pp_has_last_stage: bool
+
+    # additional training states
+    step: int
+    epoch: int
+
+    # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
+    @record
+    def __init__(self, job_config: JobConfig):
+        torch._C._log_api_usage_once("torchtitan.train")
+
+        self.job_config = job_config
+
+        logger.info(f"Starting job: {job_config.job.description}")
+
+        if job_config.experimental.custom_import:
+            importlib.import_module(job_config.experimental.custom_import)
+
+        if job_config.job.print_args:
+            logger.info(f"Running with args: {job_config.to_dict()}")
+
+        device_module, device_type = utils.device_module, utils.device_type
+        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        # Device has to be set before creating TorchFT manager.
+        device_module.set_device(self.device)
+
+        # init distributed and build meshes
+        dist_utils.init_distributed(job_config)
+        world_size = int(os.environ["WORLD_SIZE"])
+        parallelism_config = job_config.parallelism
+        self.parallel_dims = parallel_dims = ParallelDims(
+            dp_shard=parallelism_config.data_parallel_shard_degree,
+            dp_replicate=parallelism_config.data_parallel_replicate_degree,
+            cp=parallelism_config.context_parallel_degree,
+            tp=parallelism_config.tensor_parallel_degree,
+            pp=parallelism_config.pipeline_parallel_degree,
+            ep=parallelism_config.expert_parallel_degree,
+            world_size=world_size,
+        )
+
+        world_mesh = parallel_dims.world_mesh
+        if parallel_dims.dp_enabled:
+            dp_mesh = world_mesh["dp"]
+            dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
+        else:
+            dp_degree, dp_rank = 1, 0
+
+        self.ft_manager = FTManager(job_config.fault_tolerance)
+        dp_degree, dp_rank = self.ft_manager.get_dp_info(dp_degree, dp_rank)
+
+        # take control of garbage collection to avoid stragglers
+        self.gc_handler = utils.GarbageCollection(
+            gc_freq=job_config.training.gc_freq, debug=job_config.training.gc_debug
+        )
+
+        # Set random seed, and maybe enable deterministic mode
+        # (mainly for debugging, expect perf loss).
+        dist_utils.set_determinism(
+            world_mesh,
+            self.device,
+            job_config.training.seed,
+            job_config.training.deterministic,
+        )
+        self.train_spec = train_spec_module.get_train_spec("llama3")
+
+        from transformers import AutoTokenizer
+
+        # build dataloader
+        tokenizer = AutoTokenizer.from_pretrained(
+            job_config.model.name,
+        )
+        tokenizer.pad_token_id = 0
+
+        from transformers import MimiModel, AutoFeatureExtractor
+
+        audio_tokenizer = MimiModel.from_pretrained("kyutai/mimi").to(self.device)
+        feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+        tokenizer = expand_tokenizer_with_unit_tokens(
+            tokenizer,
+            codebook_size=audio_tokenizer.config.codebook_size,
+            num_quantizers=job_config.model.num_quantizers,
+        )
+
+        self.dataloader = self.train_spec.build_dataloader_fn(
+            dp_world_size=dp_degree,
+            dp_rank=dp_rank,
+            tokenizer=tokenizer,
+            audio_tokenizer=audio_tokenizer,
+            feature_extractor=feature_extractor,
+            job_config=job_config,
+        )
+
+        # set the model args from training job configs
+        # model_args.update_from_config(job_config, tokenizer)
+
+        logger.info(f"Building {self.train_spec.name}")
+        # with torch.device("meta"):
+        #     model = self.train_spec.model_cls(model_args)
+        from transformers import AutoModelForCausalLM, AutoConfig
+
+        # model = AutoModelForCausalLM.from_pretrained(job_config.model.name, torch_dtype=torch.bfloat16)
+
+        if job_config.model.pretrained:
+            model = AutoModelForCausalLM.from_pretrained(job_config.model.name)
+        else:
+            config = AutoConfig.from_pretrained(job_config.model.name)
+            model = AutoModelForCausalLM.from_config(config)
+
+        embedding_size = model.get_input_embeddings().weight.shape[0]
+        if len(tokenizer) > embedding_size:
+            model.resize_token_embeddings(len(tokenizer))
+            # model.tie_weights()
+
+        # Build the collection of model converters. No-op if `model.converters` empty
+        model_converters = build_model_converters(job_config, parallel_dims)
+        model_converters.convert(model)
+
+        # metrics logging
+        build_metrics_processor_fn = (
+            build_metrics_processor
+            if self.train_spec.build_metrics_processor_fn is None
+            else self.train_spec.build_metrics_processor_fn
+        )
+        self.metrics_processor = build_metrics_processor_fn(job_config, parallel_dims)
+        color = self.metrics_processor.color
+
+        # calculate model size and flops per token
+        (
+            model_param_count,
+            self.metrics_processor.num_flops_per_token,
+        ) = get_nparams_and_flops(model, job_config.training.seq_len)
+
+        logger.info(
+            f"{color.blue}Model {self.train_spec.name} "
+            f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
+        )
+
+        # move sharded model to CPU/GPU and initialize weights via DTensor
+        if job_config.checkpoint.create_seed_checkpoint:
+            init_device = "cpu"
+            buffer_device = None
+        elif job_config.training.enable_cpu_offload:
+            init_device = "cpu"
+            buffer_device = device_type
+        else:
+            init_device = device_type
+            buffer_device = None
+
+        self.loss_fn = self.train_spec.build_loss_fn(job_config)
+
+        # verify batch sizes
+        global_batch_size = job_config.training.global_batch_size
+        if global_batch_size < 0:
+            # This global batch size results in 1 gradient accumulation
+            # step.
+            global_batch_size = job_config.training.local_batch_size * dp_degree
+        assert global_batch_size > 0
+        assert (
+            global_batch_size % (job_config.training.local_batch_size * dp_degree) == 0
+        ), (
+            f"global batch size must be multiple of local batch size times "
+            f"data-parallel degree ({global_batch_size} "
+            f"% ({job_config.training.local_batch_size} * {dp_degree}) != 0)"
+        )
+
+        # calculate gradient accumulation steps
+        self.gradient_accumulation_steps = global_batch_size // (
+            job_config.training.local_batch_size * dp_degree
+        )
+        assert self.gradient_accumulation_steps > 0
+        self.loss_fn = rescale_accumulated_loss(
+            self.loss_fn, self.gradient_accumulation_steps
+        )
+
+        # apply parallelisms and initialization
+        if parallel_dims.pp_enabled:
+            if not self.train_spec.pipelining_fn:
+                raise RuntimeError(
+                    f"Pipeline Parallel is enabled but {self.train_spec.name} "
+                    f"does not support pipelining"
+                )
+
+            # apply both PT-D Pipeline Parallel and SPMD-style PT-D techniques
+            (
+                self.pp_schedule,
+                self.model_parts,
+                self.pp_has_first_stage,
+                self.pp_has_last_stage,
+            ) = self.train_spec.pipelining_fn(
+                model,
+                parallel_dims,
+                job_config,
+                self.device,
+                model_args,
+                self.train_spec.parallelize_fn,
+                self.loss_fn,
+            )
+            # when PP is enabled, `model` obj is no longer used after this point,
+            # model_parts is used instead
+            del model
+
+            for m in self.model_parts:
+                m.to_empty(device=init_device)
+                with torch.no_grad():
+                    m.init_weights(buffer_device=buffer_device)
+                m.train()
+
+            # confirm that user will be able to view loss metrics on the console
+            ensure_pp_loss_visible(parallel_dims, job_config, color)
+        else:
+            # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
+            model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
+
+            # model.to_empty(device=init_device)
+            # with torch.no_grad():
+            #     model.init_weights(buffer_device=buffer_device)
+            # model.train()
+            model.to(device=init_device)
+            # with torch.no_grad():
+            #     model.init_weights(buffer_device=buffer_device)
+            model.train()
+
+            self.model_parts = [model]
+
+        self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
+
+        # initialize device memory monitor and get peak flops for MFU calculation
+        device_memory_monitor = self.metrics_processor.device_memory_monitor
+        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
+        logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
+        device_mem_stats = device_memory_monitor.get_peak_stats()
+        logger.info(
+            f"{device_type.upper()} memory usage for model: "
+            f"{device_mem_stats.max_reserved_gib:.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)"
+        )
+
+        # build optimizer after applying parallelisms to the model
+        self.optimizers = self.train_spec.build_optimizers_fn(
+            self.model_parts, job_config, parallel_dims, self.ft_manager
+        )
+        self.lr_schedulers = self.train_spec.build_lr_schedulers_fn(
+            self.optimizers, job_config
+        )
+        # Post optimizer step model converters hook.
+        # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
+        # where it issues a single all-reduce for all parameters at once for better performance
+        self.optimizers.register_step_post_hook(
+            lambda *args, **kwargs: model_converters.post_optimizer_hook(
+                self.model_parts
+            )
+        )
+        self.metrics_processor.optimizers = self.optimizers
+
+        # Initialize trainer states that will be saved in checkpoint.
+        # These attributes must be initialized before checkpoint loading.
+        self.step = 0
+        self.epoch = 0
+
+        self.checkpointer = CheckpointManager(
+            dataloader=self.dataloader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states={"train_state": self},
+            job_config=job_config,
+            sd_adapter=self.train_spec.state_dict_adapter,
+            ft_manager=self.ft_manager,
+        )
+
+        loss_parallel_enabled = (
+            parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
+        )
+        self.train_context = dist_utils.get_train_context(
+            loss_parallel_enabled,
+            parallelism_config.enable_compiled_autograd,
+        )
+        self.maybe_enable_amp = dist_utils.maybe_enable_amp(
+            parallel_dims,
+            job_config.training.mixed_precision_param,
+            device_type,
+        )
+
+        # Build validator if validation is configured
+        if job_config.validation.enabled:
+            assert self.train_spec.build_validator_fn is not None
+            assert not parallel_dims.pp_enabled, (
+                "pp is enabled but validation doesn't support pipeline parallelism yet"
+            )
+
+            self.validator = self.train_spec.build_validator_fn(
+                job_config=job_config,
+                dp_world_size=dp_degree,
+                dp_rank=dp_rank,
+                tokenizer=tokenizer,
+                audio_tokenizer=audio_tokenizer,
+                feature_extractor=feature_extractor,
+                parallel_dims=parallel_dims,
+                validation_context=self.train_context,
+                maybe_enable_amp=self.maybe_enable_amp,
+                metrics_processor=self.metrics_processor,
+            )
+
+        logger.info(
+            "Trainer is initialized with "
+            f"local batch size {job_config.training.local_batch_size}, "
+            f"global batch size {global_batch_size}, "
+            f"gradient accumulation steps {self.gradient_accumulation_steps}, "
+            f"sequence length {job_config.training.seq_len}, "
+            f"total steps {job_config.training.steps} "
+            f"(warmup {job_config.lr_scheduler.warmup_steps})."
+        )
+
+    def batch_generator(
+        self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        """Returns an iterator that processes batches from the data iterator."""
+        device_type = utils.device_type
+        data_iterator = iter(data_iterable)
+
+        while True:
+            try:
+                batch = next(data_iterator)
+            except StopIteration as ex:
+                # If data runs out during gradient accumulation, that
+                # entire step will not be executed.
+                raise DataloaderStopIteration() from ex
+            data_load_start = time.perf_counter()
+            self.metrics_processor.ntokens_since_last_log += batch["input_ids"].numel()
+            self.metrics_processor.data_loading_times.append(
+                time.perf_counter() - data_load_start
+            )
+
+            yield batch
+
+    def forward_backward_step(
+        self, input_dict: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        model_parts = self.model_parts
+        parallel_dims = self.parallel_dims
+
+        # apply context parallelism if cp is enabled
+        # ensure CP handles the separate freqs_cis buffer for each pp stage
+        input_ids = input_dict["input_ids"].to(self.device)
+        attention_mask = input_dict["attention_mask"].to(self.device)
+        print(f"input_ids shape: {input_ids.shape}")
+
+        # apply context parallelism if cp is enabled
+        # ensure CP handles the separate freqs_cis buffer for each pp stage
+        # inputs = input_dict["input"]
+        # optional_context_parallel_ctx = (
+        #     dist_utils.create_context_parallel_ctx(
+        #         cp_mesh=self.world_mesh["cp"],
+        #         cp_buffers=[inputs, labels] + [m.freqs_cis for m in model_parts],
+        #         cp_seq_dims=[1, 1] + [0 for _ in model_parts],
+        #         cp_no_restore_buffers={inputs, labels},
+        #         cp_rotate_method=self.job_config.parallelism.context_parallel_rotate_method,
+        #     )
+        #     if parallel_dims.cp_enabled
+        #     else None
+        # )
+        optional_context_parallel_ctx = (
+            dist_utils.create_context_parallel_ctx(
+                cp_mesh=self.world_mesh["cp"],
+                cp_buffers=[input_ids],
+                cp_seq_dims=[1],
+                cp_no_restore_buffers={input_ids},
+                cp_rotate_method=self.job_config.parallelism.context_parallel_rotate_method,
+            )
+            if parallel_dims.cp_enabled
+            else None
+        )
+        if parallel_dims.pp_enabled:
+            # Pipeline Parallel forward / backward inside step() call
+            with self.train_context(optional_context_parallel_ctx):
+                targets, losses = (
+                    (labels, []) if self.pp_has_last_stage else (None, None)
+                )
+                if self.pp_has_first_stage:
+                    self.pp_schedule.step(
+                        inputs, target=targets, losses=losses, input_batch=inputs
+                    )
+                else:
+                    self.pp_schedule.step(
+                        target=targets, losses=losses, input_batch=inputs
+                    )
+
+            # accumulate losses across pipeline microbatches
+            # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
+            loss = (
+                torch.mean(torch.stack(losses)).to(self.device)
+                if self.pp_has_last_stage
+                else torch.tensor([-1.0], device=self.device)
+            )
+        else:
+            # Non-PP forward / backward
+            with self.train_context(optional_context_parallel_ctx):
+                assert len(model_parts) == 1
+                # with self.maybe_enable_amp:
+                #     pred = model_parts[0](inputs)
+                #     loss = self.loss_fn(pred, labels)
+                # # need to free to before bwd to avoid peaking memory
+                # del pred
+                # loss.backward()
+                with self.maybe_enable_amp:
+                    outputs = model_parts[0](
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=input_ids,
+                    )
+                    loss = outputs.loss / self.gradient_accumulation_steps
+
+                del outputs
+                loss.backward()
+
+        return loss
+
+    def train_step(
+        self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ):
+        self.optimizers.zero_grad()
+
+        # Keep these variables local to shorten the code as these are
+        # the major variables that are used in the training loop.
+        parallel_dims = self.parallel_dims
+
+        accumulated_losses = []
+        # If data runs out during gradient accumulation, that
+        # entire step will not be executed.
+        for microbatch in range(self.gradient_accumulation_steps):
+            input_dict = next(data_iterator)
+            loss = self.forward_backward_step(input_dict)
+            accumulated_losses.append(loss.detach())
+
+        grad_norm = dist_utils.clip_grad_norm_(
+            [p for m in self.model_parts for p in m.parameters()],
+            self.job_config.training.max_norm,
+            foreach=True,
+            pp_mesh=(
+                parallel_dims.world_mesh["pp"] if parallel_dims.pp_enabled else None
+            ),
+            ep_dense_params_mesh_ndim=(
+                parallel_dims.dense_params_mesh_ndim
+                if parallel_dims.ep_enabled
+                else None
+            ),
+        )
+        self.checkpointer.maybe_wait_for_staging()
+        self.optimizers.step()
+        self.lr_schedulers.step()
+
+        # Reduce the data collected over gradient accumulation steps.
+        loss = torch.sum(torch.stack(accumulated_losses))
+
+        # log metrics
+        if not self.metrics_processor.should_log(self.step):
+            return
+
+        if parallel_dims.dp_cp_enabled:
+            loss = loss.detach()
+            ft_pg = self.ft_manager.loss_sync_pg
+            global_avg_loss, global_max_loss = (
+                dist_utils.dist_mean(loss, parallel_dims.world_mesh["dp_cp"], ft_pg),
+                dist_utils.dist_max(loss, parallel_dims.world_mesh["dp_cp"], ft_pg),
+            )
+        else:
+            global_avg_loss = global_max_loss = loss.detach().item()
+
+        lr = self.optimizers.optimizers[0].param_groups[0]["lr"]
+
+        self.metrics_processor.log(
+            self.step,
+            global_avg_loss,
+            global_max_loss,
+            grad_norm.item(),
+            lr,
+            self.epoch,
+        )
+
+    @record
+    def train(self):
+        job_config = self.job_config
+
+        self.checkpointer.load(step=job_config.checkpoint.load_step)
+        logger.info(f"Training starts at step {self.step + 1}.")
+
+        with (
+            maybe_enable_profiling(job_config, global_step=self.step) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config, global_step=self.step
+            ) as memory_profiler,
+            maybe_semi_sync_training(
+                job_config.fault_tolerance,
+                ft_manager=self.ft_manager,
+                model_parts=self.model_parts,
+                optimizer=self.optimizers,
+            ),
+        ):
+            data_iterator = self.batch_generator(self.dataloader)
+            while self.step < job_config.training.steps:
+                self.step += 1
+                self.gc_handler.run(self.step)
+                try:
+                    self.train_step(data_iterator)
+                except DataloaderStopIteration:
+                    logger.warning("Ran out of data; last step was canceled.")
+                    break
+
+                # Run validation if validator is available
+                if (
+                    self.job_config.validation.enabled
+                    and self.validator.should_validate(self.step)
+                ):
+                    self.validator.validate(self.model_parts, self.step)
+
+                self.checkpointer.save(
+                    self.step, last_step=(self.step == job_config.training.steps)
+                )
+
+                # signal the profiler that the next profiling step has started
+                if torch_profiler:
+                    torch_profiler.step()
+                if memory_profiler:
+                    memory_profiler.step()
+
+                # reduce timeout after first train step for faster signal
+                # (assuming lazy init and compilation are finished)
+                if self.step == 1:
+                    dist_utils.set_pg_timeouts(
+                        timeout=timedelta(
+                            seconds=job_config.comm.train_timeout_seconds
+                        ),
+                        world_mesh=self.parallel_dims.world_mesh,
+                    )
+
+        if torch.distributed.get_rank() == 0:
+            logger.info("Sleeping 2 seconds for other ranks to complete")
+            time.sleep(2)
+
+        logger.info("Training completed")
+
+    def validation(self, data_loader):
+        # clear_gpu_memory()
+        self.model.eval()
+        local_loss = 0.0
+        total_tokens = 0
+
+        with torch.no_grad():
+            for batch in data_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+
+                with autocast("cuda", dtype=torch.bfloat16):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=input_ids,
+                    )
+                    loss = outputs.loss.item()
+                    local_loss += loss * input_ids.size(0)
+                    total_tokens += input_ids.size(0)
+
+                del outputs, input_ids, attention_mask
+
+        local_loss = torch.tensor([local_loss], device=self.device)
+        total_tokens = torch.tensor([total_tokens], device=self.device)
+        import torch.distributed as dist
+
+        dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+
+        if dist.get_rank() == 0:
+            validation_loss = (local_loss / total_tokens).item()
+            self.metrics_processor.logger.log(
+                {"validation/loss": validation_loss}, self.step
+            )
+            logger.info(
+                f"{self.metrics_processor.color.green}loss: {validation_loss:.4f}{self.metrics_processor.color.reset}"
+            )
+
+        self.model.train()
+        # clear_gpu_memory()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"step": self.step, "epoch": self.epoch}
+
+    def load_state_dict(self, state_dict: dict[str, Any]):
+        self.step = state_dict["step"]
+        self.epoch = state_dict["epoch"]
+
+    def close(self) -> None:
+        if self.checkpointer:
+            self.checkpointer.close()
+        if self.metrics_processor:
+            self.metrics_processor.close()
+
+
+if __name__ == "__main__":
+    init_logger()
+    config_manager = ConfigManager()
+    config = config_manager.parse_args()
+    trainer: Optional[Trainer] = None
+
+    # import torch.multiprocessing as mp
+
+    # mp.set_start_method("spawn")
+
+    try:
+        trainer = Trainer(config)
+
+        if config.checkpoint.create_seed_checkpoint:
+            assert int(os.environ["WORLD_SIZE"]) == 1, (
+                "Must create seed checkpoint using a single device, to disable sharding."
+            )
+            assert config.checkpoint.enable_checkpoint, (
+                "Must enable checkpointing when creating a seed checkpoint."
+            )
+            trainer.checkpointer.save(curr_step=0, last_step=True)
+            logger.info("Created seed checkpoint")
+        else:
+            trainer.train()
+    except Exception:
+        if trainer:
+            trainer.close()
+        raise
+    else:
+        trainer.close()
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed.")
