@@ -102,7 +102,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         if dataset_name == "peoples_speech":
             ds = load_dataset(
                 "parquet",
-                data_dir="data/peoples_speech/clean",
+                data_files="data/peoples_speech/**/*.parquet",
                 split="train",
                 streaming=True,
             )

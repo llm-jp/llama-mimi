@@ -111,7 +111,7 @@ top_k = 30
 do_sample = True
 max_length = 1024
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_id = "llm-jp/Llama-Mimi-1.3B"
+model_id = "models/Llama-3.2-1B_peoples_speech-q4-s1024"
 model = (
     AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     .eval()

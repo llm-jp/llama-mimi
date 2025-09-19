@@ -2,11 +2,12 @@
 
 # Llama-Mimi
 #### Autoregressive Speech Language Modeling with Interleaved Semantic and Acoustic Tokens
-[📃Paper](https://arxiv.org/abs/2509.14882) | [🤗Model](https://huggingface.co/llm-jp/Llama-Mimi-1.3B) | [🗣️Demo](https://speed1313.github.io/llama-mimi/)
+| [📃Paper](https://arxiv.org/abs/2509.14882) | [🤗Models](https://huggingface.co/llm-jp/Llama-Mimi-1.3B) | [🗣️Online Demo](https://speed1313.github.io/llama-mimi/)
 
 <img src="assets/llama-mimi.png" width="60%"/>
 
 </div>
+
 
 
 ## Introduction
@@ -41,7 +42,7 @@ uv run python inference.py
 
 ## Pre-train Llama-Mimi on The People's Speech
 
-To pre-train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech), first download the dataset locally:
+To pre-train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech) (30k hours), first download the dataset locally:
 ```bash
 uv run huggingface-cli download  MLCommons/peoples_speech  --repo-type dataset --local-dir data/peoples_speech
 ```
@@ -52,10 +53,11 @@ torchrun --nproc_per_node=8 --local-ranks-filter 0 \
       --role rank --tee 3 -m torchtitan.train \
       --job.config_file config/llama3_2_1b_peoples_speech.toml
 ```
-You can monitor training statistics with Weights & Biases (W&B).
+This config trains Llama-Mimi-1.3B for 5,000 steps with a global batch size of 1,024 on 8 GPUs.
+Training progress can be monitored with Weights & Biases (W&B).
 
 <div align="center">
-<img src="assets/log_validation.png" width="60%"/>
+<img src="assets/log_validation.png" width="40%"/>
 </div>
 
 To use a custom dataset, update the configuration in `torchtitan/datasets/hf_dataset.py`. We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
