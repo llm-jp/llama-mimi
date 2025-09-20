@@ -53,7 +53,7 @@ torchrun --nproc_per_node=8 --local-ranks-filter 0 \
       --role rank --tee 3 -m torchtitan.train \
       --job.config_file config/llama3_2_1b_peoples_speech.toml
 ```
-This config trains Llama-Mimi-1.3B for 5,000 steps with a global batch size of 1,024 on 8 GPUs.
+This configuration trains Llama-Mimi-1.3B for 5,000 steps with a global batch size of 1,024 on 8 GPUs, taking about 8 hours.
 Training progress can be monitored with Weights & Biases (W&B).
 
 <div align="center">
